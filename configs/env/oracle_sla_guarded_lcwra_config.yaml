@@ -1,0 +1,17 @@
+oracle_sla_guarded_lcwra:
+  horizon_steps: 32
+  timestep_minutes: 15
+  low_carbon_quantile: 0.25
+  min_lcw_overlap_ratio: 0.5
+  deadline_feasibility: true
+  sla_guard_enabled: true
+  min_deadline_slack_min: 15
+  queue_wait_safety_factor: 1.2
+  max_estimated_queue_wait_min: null
+  objective: "sla_guarded_marginal_system_carbon"
+  ci_source_mode: "oracle"
+  fallback_order:
+    - reachable_lcw_and_sla_safe
+    - deadline_feasible_lowest_sla_risk
+    - lowest_predicted_marginal_system_carbon_feasible
+    - lowest_estimated_queue_wait

@@ -5,7 +5,7 @@ from collections import defaultdict
 from envs.sustaindc.sustaindc_env import SustainDC
 from utils.task_assignment_strategies import (DistributeMostAvailable, DistributeRandom, DistributePriorityOrder, DistributeLowestPrice, DistributeLeastPending, 
                                                 DistributeLowestCarbon, DistributeRoundRobin, DistributeLowestUtilization, BaseRBCStrategy, DistributeLocalOnly,
-                                                DistributeReachableLowCarbon)
+                                                DistributeReachableLowCarbon, DistributeOracleSLAGuardedLCWRA)
 
 import numpy as np
 import pandas as pd
@@ -95,6 +95,7 @@ class DatacenterClusterManager:
                             "lowest_utilization": DistributeLowestUtilization(),
                             "local_only": DistributeLocalOnly(),
                             "reachable_low_carbon": DistributeReachableLowCarbon(),
+                            "oracle_sla_guarded_lcwra": DistributeOracleSLAGuardedLCWRA(),
                         }
 
     def reset(self, seed=None):

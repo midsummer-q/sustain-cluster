@@ -20,6 +20,8 @@ def build_lcwra_audit_record(
     selected = selected_plan
     reachable_count = sum(1 for plan in plans if getattr(plan, "reachable_lcw", False))
     deadline_count = sum(1 for plan in plans if getattr(plan, "deadline_feasible", False))
+    sla_safe_count = sum(1 for plan in plans if getattr(plan, "sla_safe", False))
+    rejected_by_guard_count = sum(1 for plan in plans if getattr(plan, "rejected_by_sla_guard", False))
 
     actual_start_time = actual_start_time if actual_start_time is not None else getattr(task, "start_time", None)
     actual_finish_time = actual_finish_time if actual_finish_time is not None else getattr(task, "finish_time", None)
@@ -51,6 +53,13 @@ def build_lcwra_audit_record(
         "actual_low_carbon_overlap_ratio": actual_overlap,
         "low_carbon_overlap_error": overlap_error,
         "reachable_lcw": getattr(selected, "reachable_lcw", False),
+        "ci_source_mode": getattr(selected, "ci_source_mode", None),
+        "deadline_slack_min": getattr(selected, "deadline_slack_min", None),
+        "sla_safe": getattr(selected, "sla_safe", False),
+        "sla_risk_score": getattr(selected, "sla_risk_score", None),
+        "queue_wait_safety_factor": getattr(selected, "queue_wait_safety_factor", None),
+        "selected_guard_stage": getattr(selected, "selected_guard_stage", None),
+        "rejected_by_sla_guard": getattr(selected, "rejected_by_sla_guard", False),
         "low_carbon_missed": actual_missed,
         "actual_low_carbon_missed": actual_missed,
         "actual_low_carbon_hit": actual_hit,
@@ -62,6 +71,9 @@ def build_lcwra_audit_record(
         "candidate_count": len(plans),
         "reachable_candidate_count": reachable_count,
         "deadline_feasible_candidate_count": deadline_count,
+        "sla_safe_candidate_count": sla_safe_count,
+        "rejected_by_sla_guard_candidate_count": rejected_by_guard_count,
+        "any_candidate_rejected_by_sla_guard": rejected_by_guard_count > 0,
         "selected_reason": getattr(selected, "reason", None),
         "plan_start_error_min": _error_minutes(planned_start, actual_start_time),
         "plan_finish_error_min": _error_minutes(planned_finish, actual_finish_time),

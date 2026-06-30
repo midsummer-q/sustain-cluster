@@ -2,11 +2,29 @@
 
 import os
 import random
+import math
 import numpy as np
 import logging # Use standard logging
 
 from utils.config_loader import load_yaml
 from utils.reachability_estimator import DEFAULT_LCWRA_CONFIG, estimate_candidate_plan
+
+
+DEFAULT_ORACLE_SLA_GUARDED_LCWRA_CONFIG = {
+    **DEFAULT_LCWRA_CONFIG,
+    "ci_source_mode": "oracle",
+    "sla_guard_enabled": True,
+    "min_deadline_slack_min": 15,
+    "queue_wait_safety_factor": 1.2,
+    "max_estimated_queue_wait_min": None,
+    "objective": "sla_guarded_marginal_system_carbon",
+    "fallback_order": [
+        "reachable_lcw_and_sla_safe",
+        "deadline_feasible_lowest_sla_risk",
+        "lowest_predicted_marginal_system_carbon_feasible",
+        "lowest_estimated_queue_wait",
+    ],
+}
 
 # --- Base Class ---
 class BaseRBCStrategy:
@@ -301,6 +319,182 @@ class DistributeReachableLowCarbon(BaseRBCStrategy):
         task.selected_plan_reason = selected_plan.reason
         task.lcwra_selected_plan = selected_plan
         task.lcwra_candidate_plans = candidate_plans
+
+
+class DistributeOracleSLAGuardedLCWRA(DistributeReachableLowCarbon):
+    """
+    Oracle smoke-test variant of LCWRA.
+
+    This strategy intentionally reuses the existing LCWRA future-CI estimator,
+    which reads ``dc.ci_manager.carbon_smooth``. It is an oracle benchmark for
+    Layer 3 value testing, not an online forecast algorithm.
+    """
+    def __init__(self, config_path="configs/env/oracle_sla_guarded_lcwra_config.yaml", config=None):
+        BaseRBCStrategy.__init__(self)
+        self.config = dict(DEFAULT_ORACLE_SLA_GUARDED_LCWRA_CONFIG)
+        self.config.update(config or self._load_config(config_path))
+        self.config["ci_source_mode"] = "oracle"
+        self.last_candidate_plans = []
+        self.last_selected_plan = None
+
+    def __call__(self, task, datacenters: dict, logger: logging.Logger = None, **kwargs):
+        current_time = kwargs.get("current_time")
+        cluster_manager = kwargs.get("cluster_manager")
+        if current_time is None or cluster_manager is None:
+            if logger:
+                logger.warning("OracleSLAGuardedLCWRA missing current_time or cluster_manager; falling back to least pending.")
+            return DistributeLeastPending()(task, datacenters, logger=logger)
+
+        candidate_plans = []
+        for dc_name, dc in datacenters.items():
+            try:
+                plan = estimate_candidate_plan(
+                    task=task,
+                    dest_dc=dc,
+                    dest_dc_name=dc_name,
+                    current_time=current_time,
+                    cluster_manager=cluster_manager,
+                    config=self.config,
+                )
+                self._apply_sla_guard(plan, task)
+                candidate_plans.append(plan)
+            except Exception as exc:
+                if logger:
+                    logger.warning(f"OracleSLAGuardedLCWRA failed to estimate {dc_name} for task {task.job_name}: {exc}")
+
+        self.last_candidate_plans = candidate_plans
+        if not candidate_plans:
+            if logger:
+                logger.warning(f"OracleSLAGuardedLCWRA found no candidates for task {task.job_name}; using origin DC.")
+            return getattr(task, "origin_dc_id", None)
+
+        selected_plan = self._select_plan(candidate_plans)
+        self.last_selected_plan = selected_plan
+        self._attach_plan_to_task(task, selected_plan, candidate_plans)
+
+        if logger:
+            logger.info(
+                f"OracleSLAGuardedLCWRA choice for task {task.job_name}: DC{selected_plan.dest_dc_id} "
+                f"(stage={selected_plan.selected_guard_stage}, reachable={selected_plan.reachable_lcw}, "
+                f"sla_safe={selected_plan.sla_safe}, slack={selected_plan.deadline_slack_min:.2f} min, "
+                f"risk={selected_plan.sla_risk_score:.2f}, "
+                f"predicted_marginal_system_carbon={selected_plan.predicted_marginal_system_carbon_kg:.6f} kg)"
+            )
+
+        return selected_plan.dest_dc_id
+
+    def _load_config(self, config_path):
+        if not config_path or not os.path.exists(config_path):
+            return {}
+        loaded = load_yaml(config_path) or {}
+        return loaded.get("oracle_sla_guarded_lcwra", loaded.get("lcwra", loaded))
+
+    def _apply_sla_guard(self, plan, task):
+        plan.ci_source_mode = "oracle"
+        plan.queue_wait_safety_factor = float(self.config.get("queue_wait_safety_factor", 1.2))
+        plan.deadline_slack_min = self._deadline_slack_min(task, plan)
+
+        min_slack = float(self.config.get("min_deadline_slack_min", 15))
+        estimated_wait = float(getattr(plan, "estimated_queue_wait_min", float("inf")))
+        max_wait = self.config.get("max_estimated_queue_wait_min")
+        if max_wait == "None":
+            max_wait = None
+
+        finite_wait = math.isfinite(estimated_wait)
+        under_max_wait = True if max_wait is None else estimated_wait <= float(max_wait)
+        guard_enabled = bool(self.config.get("sla_guard_enabled", True))
+        plan.sla_safe = (
+            bool(getattr(plan, "resource_feasible", False))
+            and bool(getattr(plan, "deadline_feasible", False))
+            and (not guard_enabled or float(plan.deadline_slack_min) >= min_slack)
+            and finite_wait
+            and under_max_wait
+        )
+        wait_penalty = float("inf") if not finite_wait else max(
+            0.0,
+            estimated_wait * (plan.queue_wait_safety_factor - 1.0),
+        )
+        slack_penalty = (
+            float("inf")
+            if plan.deadline_slack_min is None or not math.isfinite(float(plan.deadline_slack_min))
+            else max(0.0, min_slack - float(plan.deadline_slack_min))
+        )
+        plan.sla_risk_score = slack_penalty + wait_penalty
+        plan.rejected_by_sla_guard = bool(getattr(plan, "reachable_lcw", False) and not plan.sla_safe)
+        plan.selected_guard_stage = None
+        return plan
+
+    def _deadline_slack_min(self, task, plan):
+        sla_deadline = getattr(task, "sla_deadline", None)
+        planned_finish = getattr(plan, "planned_finish_time", None)
+        if sla_deadline is None or planned_finish is None:
+            return float("-inf")
+        if planned_finish is None or planned_finish is np.nan:
+            return float("-inf")
+        if pd_is_timestamp_max(planned_finish):
+            return float("-inf")
+        try:
+            return (sla_deadline - planned_finish).total_seconds() / 60.0
+        except Exception:
+            return float("-inf")
+
+    def _select_plan(self, candidate_plans):
+        safe_reachable = [
+            plan for plan in candidate_plans
+            if getattr(plan, "reachable_lcw", False) and getattr(plan, "sla_safe", False)
+        ]
+        if safe_reachable:
+            selected = min(safe_reachable, key=lambda plan: plan.predicted_marginal_system_carbon_kg)
+            selected.reason = "selected_oracle_sla_guarded_reachable_low_carbon"
+            selected.selected_guard_stage = "reachable_lcw_and_sla_safe"
+            return selected
+
+        deadline_feasible = [
+            plan for plan in candidate_plans
+            if getattr(plan, "deadline_feasible", False)
+        ]
+        if deadline_feasible:
+            selected = min(
+                deadline_feasible,
+                key=lambda plan: (
+                    _finite_or_inf(getattr(plan, "sla_risk_score", float("inf"))),
+                    _finite_or_inf(getattr(plan, "predicted_marginal_system_carbon_kg", float("inf"))),
+                ),
+            )
+            selected.reason = "fallback_deadline_feasible_lowest_sla_risk"
+            selected.selected_guard_stage = "deadline_feasible_lowest_sla_risk"
+            return selected
+
+        resource_feasible = [
+            plan for plan in candidate_plans
+            if getattr(plan, "resource_feasible", False)
+        ]
+        if resource_feasible:
+            selected = min(resource_feasible, key=lambda plan: _finite_or_inf(plan.estimated_queue_wait_min))
+            selected.reason = "fallback_resource_feasible_lowest_estimated_queue_wait"
+            selected.selected_guard_stage = "lowest_estimated_queue_wait"
+            return selected
+
+        selected = min(candidate_plans, key=lambda plan: _finite_or_inf(plan.estimated_queue_wait_min))
+        selected.reason = "fallback_lowest_estimated_queue_wait"
+        selected.selected_guard_stage = "lowest_estimated_queue_wait"
+        return selected
+
+
+def _finite_or_inf(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float("inf")
+    return value if math.isfinite(value) else float("inf")
+
+
+def pd_is_timestamp_max(value):
+    try:
+        import pandas as pd
+        return pd.Timestamp(value) == pd.Timestamp.max
+    except Exception:
+        return False
 
 
 class DistributeRoundRobin(BaseRBCStrategy):

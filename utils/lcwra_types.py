@@ -32,3 +32,10 @@ class CandidatePlan:
     predicted_marginal_system_carbon_kg: float
     predicted_system_carbon_kg: float
     reason: str
+    ci_source_mode: Optional[str] = None
+    deadline_slack_min: Optional[float] = None
+    sla_safe: bool = False
+    sla_risk_score: Optional[float] = None
+    queue_wait_safety_factor: Optional[float] = None
+    selected_guard_stage: Optional[str] = None
+    rejected_by_sla_guard: bool = False

@@ -143,6 +143,7 @@ def estimate_candidate_plan(task, dest_dc, dest_dc_name, current_time, cluster_m
         # system carbon, not to the legacy task-level carbon proxy.
         predicted_system_carbon_kg=predicted_marginal_system_carbon_kg,
         reason=reason,
+        ci_source_mode=cfg.get("ci_source_mode"),
     )
 
 

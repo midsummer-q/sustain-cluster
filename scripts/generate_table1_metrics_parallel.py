@@ -69,6 +69,10 @@ LCWRA_COLUMNS = [
     "avg_low_carbon_overlap_ratio",
     "planned_start_mae_min",
     "planned_finish_mae_min",
+    "avg_deadline_slack_min",
+    "sla_safe_selection_rate",
+    "avg_sla_risk_score",
+    "rejected_by_sla_guard_rate",
     "lcwra_selected_count",
     "lcwra_completed_count",
     "lcwra_completion_coverage",
@@ -77,30 +81,6 @@ LCWRA_COLUMNS = [
 # Define controllers for Table 1
 CONTROLLERS_TO_EVALUATE = [
     {
-    "name": "RL (Geo+Time)",
-    "strategy": "manual_rl",
-    "checkpoint": DEFAULT_RL_CHECKPOINT_PATH,
-    "disable_defer": False,
-    "local_only": False,
-    "is_rl": True,
-    },
-    {
-    "name": "RL (Geo Only)",
-    "strategy": "manual_rl",
-    "checkpoint": DEFAULT_RL_CHECKPOINT_PATH,
-    "disable_defer": True, # Force assignment (no action 0)
-    "local_only": False,
-    "is_rl": True,
-    },
-    {
-    "name": "RL (Time Only)",
-    "strategy": "manual_rl",
-    "checkpoint": DEFAULT_RL_CHECKPOINT_PATH,
-    "disable_defer": False,
-    "local_only": True, # Force assignment only to origin DC (or defer)
-    "is_rl": True,
-    },
-    {
         "name": "RBC (Lowest Carbon)",
         "strategy": "lowest_carbon",
         "is_rl": False,
@@ -108,6 +88,21 @@ CONTROLLERS_TO_EVALUATE = [
     {
         "name": "RBC (Reachable Low Carbon)",
         "strategy": "reachable_low_carbon",
+        "is_rl": False,
+    },
+    {
+        "name": "RBC (Oracle SLA-Guarded LCWRA)",
+        "strategy": "oracle_sla_guarded_lcwra",
+        "is_rl": False,
+    },
+    {
+        "name": "RBC (Least Pending)",
+        "strategy": "least_pending",
+        "is_rl": False,
+    },
+    {
+        "name": "RBC (Local Only)",
+        "strategy": "local_only",
         "is_rl": False,
     },
     {
@@ -126,16 +121,6 @@ CONTROLLERS_TO_EVALUATE = [
         "is_rl": False,
     },
     {
-        "name": "RBC (Least Pending)",
-        "strategy": "least_pending",
-        "is_rl": False,
-    },
-    {
-        "name": "RBC (Local Only)",
-        "strategy": "local_only",
-        "is_rl": False,
-    },
-    {
         "name": "RBC (Random)",
         "strategy": "random",
         "is_rl": False,
@@ -148,12 +133,13 @@ log_dir = f"logs/table1_eval_{timestamp}"
 os.makedirs(log_dir, exist_ok=True)
 log_path = os.path.join(log_dir, f"evaluation_table1_{timestamp}.log")
 results_csv_path = os.path.join(log_dir, f"results_table1_{timestamp}.csv")
-facility_output_dir = os.path.join("outputs", "facility_carbon_baselines")
+oracle_layer3_output_dir = os.path.join("outputs", "oracle_layer3_smoke_test")
+facility_output_dir = oracle_layer3_output_dir
 facility_summary_csv_path = os.path.join(facility_output_dir, "controller_summary.csv")
 facility_raw_csv_path = os.path.join(facility_output_dir, "controller_summary_raw.csv")
-lcwra_output_dir = os.path.join("outputs", "lcwra_baselines")
+lcwra_output_dir = oracle_layer3_output_dir
 lcwra_summary_csv_path = os.path.join(lcwra_output_dir, "controller_summary.csv")
-lcwra_audit_csv_path = os.path.join(lcwra_output_dir, "lcwra_audit.csv")
+lcwra_audit_csv_path = os.path.join(lcwra_output_dir, "oracle_sla_guarded_lcwra_audit.csv")
 
 logger = logging.getLogger("table1_eval_logger")
 logger.setLevel(logging.INFO)
@@ -476,6 +462,24 @@ def _summarize_lcwra_audit_records(records):
         for record in completed_records
         if record.get("plan_finish_error_min") is not None
     ]
+    deadline_slacks = [
+        float(record["deadline_slack_min"])
+        for record in selected_records
+        if record.get("deadline_slack_min") is not None
+    ]
+    sla_safe_flags = [
+        bool(record.get("sla_safe", False))
+        for record in selected_records
+    ]
+    sla_risk_scores = [
+        float(record["sla_risk_score"])
+        for record in selected_records
+        if record.get("sla_risk_score") is not None
+    ]
+    rejected_by_guard_flags = [
+        bool(record.get("any_candidate_rejected_by_sla_guard", record.get("rejected_by_sla_guard", False)))
+        for record in selected_records
+    ]
 
     reachable_rate = float(np.mean(reachable_flags)) if reachable_flags else np.nan
     planned_overlap = float(np.mean(planned_overlaps)) if planned_overlaps else np.nan
@@ -494,6 +498,10 @@ def _summarize_lcwra_audit_records(records):
         "avg_low_carbon_overlap_ratio": planned_overlap,
         "planned_start_mae_min": float(np.mean(start_errors)) if start_errors else np.nan,
         "planned_finish_mae_min": float(np.mean(finish_errors)) if finish_errors else np.nan,
+        "avg_deadline_slack_min": float(np.mean(deadline_slacks)) if deadline_slacks else np.nan,
+        "sla_safe_selection_rate": float(np.mean(sla_safe_flags)) if sla_safe_flags else np.nan,
+        "avg_sla_risk_score": float(np.mean(sla_risk_scores)) if sla_risk_scores else np.nan,
+        "rejected_by_sla_guard_rate": float(np.mean(rejected_by_guard_flags)) if rejected_by_guard_flags else np.nan,
         "lcwra_selected_count": selected_count,
         "lcwra_completed_count": completed_count,
         "lcwra_completion_coverage": completion_coverage,
@@ -594,6 +602,10 @@ if __name__ == "__main__":
             "avg_low_carbon_overlap_ratio": ['mean', 'std'],
             "planned_start_mae_min": ['mean', 'std'],
             "planned_finish_mae_min": ['mean', 'std'],
+            "avg_deadline_slack_min": ['mean', 'std'],
+            "sla_safe_selection_rate": ['mean', 'std'],
+            "avg_sla_risk_score": ['mean', 'std'],
+            "rejected_by_sla_guard_rate": ['mean', 'std'],
             "lcwra_selected_count": ['mean', 'std'],
             "lcwra_completed_count": ['mean', 'std'],
             "lcwra_completion_coverage": ['mean', 'std'],
