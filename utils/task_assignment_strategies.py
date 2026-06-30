@@ -1,13 +1,17 @@
 # utils/task_assignment_strategies.py
 
+import os
 import random
 import numpy as np
 import logging # Use standard logging
 
+from utils.config_loader import load_yaml
+from utils.reachability_estimator import DEFAULT_LCWRA_CONFIG, estimate_candidate_plan
+
 # --- Base Class ---
 class BaseRBCStrategy:
     """Base class for all Rule-Based Controller strategies."""
-    def __call__(self, task, datacenters: dict, logger: logging.Logger = None):
+    def __call__(self, task, datacenters: dict, logger: logging.Logger = None, **kwargs):
         """
         Selects a destination datacenter ID for the given task.
 
@@ -34,7 +38,7 @@ class DistributeMostAvailable(BaseRBCStrategy):
     Assigns the task to the datacenter with the MOST available CPU cores
     AMONG THOSE THAT CAN SCHEDULE the task.
     """
-    def __call__(self, task, datacenters: dict, logger: logging.Logger = None):
+    def __call__(self, task, datacenters: dict, logger: logging.Logger = None, **kwargs):
         if not datacenters:
              if logger: logger.error("MostAvailable: No datacenters provided.")
              return None
@@ -67,7 +71,7 @@ class DistributeMostAvailable(BaseRBCStrategy):
 
 class DistributeRandom(BaseRBCStrategy):
     """Randomly assigns the task to one of the available datacenters."""
-    def __call__(self, task, datacenters: dict, logger: logging.Logger = None):
+    def __call__(self, task, datacenters: dict, logger: logging.Logger = None, **kwargs):
         if not datacenters:
              if logger: logger.error("Random: No datacenters provided.")
              return None
@@ -90,7 +94,7 @@ class DistributePriorityOrder(BaseRBCStrategy):
         self.priority_order = priority_order
         super().__init__()
 
-    def __call__(self, task, datacenters: dict, logger: logging.Logger = None):
+    def __call__(self, task, datacenters: dict, logger: logging.Logger = None, **kwargs):
         if not datacenters:
              if logger: logger.error("PriorityOrder: No datacenters provided.")
              return None
@@ -113,7 +117,7 @@ class DistributeLowestPrice(BaseRBCStrategy):
     Assigns the task to the available datacenter with the lowest current
     electricity price ($/MWh).
     """
-    def __call__(self, task, datacenters: dict, logger: logging.Logger = None):
+    def __call__(self, task, datacenters: dict, logger: logging.Logger = None, **kwargs):
         if not datacenters:
             if logger: logger.error("LowestPrice: No datacenters provided.")
             return None
@@ -150,7 +154,7 @@ class DistributeLowestPrice(BaseRBCStrategy):
 
 class DistributeLeastPending(BaseRBCStrategy):
     """Assigns the task to the datacenter with the fewest pending tasks."""
-    def __call__(self, task, datacenters: dict, logger: logging.Logger = None):
+    def __call__(self, task, datacenters: dict, logger: logging.Logger = None, **kwargs):
         if not datacenters:
             if logger: logger.error("LeastPending: No datacenters provided.")
             return None
@@ -172,7 +176,7 @@ class DistributeLowestCarbon(BaseRBCStrategy):
     Assigns the task to the available datacenter with the lowest current
     carbon intensity (gCO2/kWh).
     """
-    def __call__(self, task, datacenters: dict, logger: logging.Logger = None):
+    def __call__(self, task, datacenters: dict, logger: logging.Logger = None, **kwargs):
         if not datacenters:
             if logger: logger.error("LowestCarbon: No datacenters provided.")
             return None
@@ -207,6 +211,98 @@ class DistributeLowestCarbon(BaseRBCStrategy):
         return best_dc.dc_id
 
 
+class DistributeReachableLowCarbon(BaseRBCStrategy):
+    """
+    Chooses a datacenter whose estimated execution window can actually overlap
+    with a low-carbon window under transmission delay, queue wait, resources,
+    and deadline constraints.
+    """
+    def __init__(self, config_path="configs/env/lcwra_config.yaml", config=None):
+        super().__init__()
+        self.config = dict(DEFAULT_LCWRA_CONFIG)
+        self.config.update(config or self._load_config(config_path))
+        self.last_candidate_plans = []
+        self.last_selected_plan = None
+
+    def __call__(self, task, datacenters: dict, logger: logging.Logger = None, **kwargs):
+        current_time = kwargs.get("current_time")
+        cluster_manager = kwargs.get("cluster_manager")
+        if current_time is None or cluster_manager is None:
+            if logger:
+                logger.warning("ReachableLowCarbon missing current_time or cluster_manager; falling back to least pending.")
+            return DistributeLeastPending()(task, datacenters, logger=logger)
+
+        candidate_plans = []
+        for dc_name, dc in datacenters.items():
+            try:
+                candidate_plans.append(
+                    estimate_candidate_plan(
+                        task=task,
+                        dest_dc=dc,
+                        dest_dc_name=dc_name,
+                        current_time=current_time,
+                        cluster_manager=cluster_manager,
+                        config=self.config,
+                    )
+                )
+            except Exception as exc:
+                if logger:
+                    logger.warning(f"ReachableLowCarbon failed to estimate {dc_name} for task {task.job_name}: {exc}")
+
+        self.last_candidate_plans = candidate_plans
+        if not candidate_plans:
+            if logger:
+                logger.warning(f"ReachableLowCarbon found no candidates for task {task.job_name}; using origin DC.")
+            return getattr(task, "origin_dc_id", None)
+
+        reachable = [plan for plan in candidate_plans if plan.reachable_lcw]
+        if reachable:
+            selected_plan = min(reachable, key=lambda plan: plan.predicted_marginal_system_carbon_kg)
+            selected_plan.reason = "selected_reachable_low_carbon"
+        else:
+            feasible = [
+                plan for plan in candidate_plans
+                if plan.resource_feasible and plan.deadline_feasible
+            ]
+            if feasible:
+                selected_plan = min(feasible, key=lambda plan: plan.predicted_marginal_system_carbon_kg)
+                selected_plan.reason = "fallback_lowest_predicted_marginal_system_carbon_feasible"
+            else:
+                selected_plan = min(candidate_plans, key=lambda plan: plan.estimated_queue_wait_min)
+                selected_plan.reason = "fallback_lowest_estimated_queue_wait"
+
+        self.last_selected_plan = selected_plan
+        self._attach_plan_to_task(task, selected_plan, candidate_plans)
+
+        if logger:
+            logger.info(
+                f"ReachableLowCarbon choice for task {task.job_name}: DC{selected_plan.dest_dc_id} "
+                f"(reachable={selected_plan.reachable_lcw}, overlap={selected_plan.low_carbon_overlap_ratio:.3f}, "
+                f"predicted_marginal_system_carbon={selected_plan.predicted_marginal_system_carbon_kg:.6f} kg, "
+                f"reason={selected_plan.reason})"
+            )
+
+        return selected_plan.dest_dc_id
+
+    def _load_config(self, config_path):
+        if not config_path or not os.path.exists(config_path):
+            return {}
+        loaded = load_yaml(config_path) or {}
+        return loaded.get("lcwra", loaded)
+
+    def _attach_plan_to_task(self, task, selected_plan, candidate_plans):
+        task.planned_start_time = selected_plan.planned_start_time
+        task.planned_finish_time = selected_plan.planned_finish_time
+        task.planned_dest_dc_id = selected_plan.dest_dc_id
+        task.planned_low_carbon_window_start = selected_plan.low_carbon_window_start
+        task.planned_low_carbon_window_end = selected_plan.low_carbon_window_end
+        task.low_carbon_overlap_ratio = selected_plan.low_carbon_overlap_ratio
+        task.reachable_lcw = selected_plan.reachable_lcw
+        task.selected_plan_reason = selected_plan.reason
+        task.lcwra_selected_plan = selected_plan
+        task.lcwra_candidate_plans = candidate_plans
+
+
 class DistributeRoundRobin(BaseRBCStrategy):
     """Assigns tasks in a round-robin fashion across datacenters."""
     def __init__(self):
@@ -222,7 +318,7 @@ class DistributeRoundRobin(BaseRBCStrategy):
         if logging.getLogger().isEnabledFor(logging.DEBUG): # Avoid calculation if not debugging
              logging.debug("RoundRobin state reset.")
 
-    def __call__(self, task, datacenters: dict, logger: logging.Logger = None):
+    def __call__(self, task, datacenters: dict, logger: logging.Logger = None, **kwargs):
         if not datacenters:
             if logger: logger.error("RoundRobin: No datacenters provided.")
             return None
@@ -261,7 +357,7 @@ class DistributeRoundRobin(BaseRBCStrategy):
 
 class DistributeLocalOnly(BaseRBCStrategy):
     """Assigns the task strictly to its origin datacenter."""
-    def __call__(self, task, datacenters: dict, logger: logging.Logger = None):
+    def __call__(self, task, datacenters: dict, logger: logging.Logger = None, **kwargs):
         if not hasattr(task, 'origin_dc_id') or task.origin_dc_id is None:
             if logger: logger.error(f"LocalOnly: Task {task.job_name} missing valid origin_dc_id.")
             # Decide fallback: Maybe assign randomly? Or return None? Let's return None.
@@ -290,7 +386,7 @@ class DistributeLocalOnly(BaseRBCStrategy):
 
 class DistributeLowestUtilization(BaseRBCStrategy):
     """Assigns the task to the datacenter with the highest overall average resource availability."""
-    def __call__(self, task, datacenters: dict, logger: logging.Logger = None):
+    def __call__(self, task, datacenters: dict, logger: logging.Logger = None, **kwargs):
         if not datacenters:
              if logger: logger.error("LowestUtilization: No datacenters provided.")
              return None

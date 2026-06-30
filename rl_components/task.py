@@ -73,6 +73,24 @@ class Task:
         
         # Flag to indicate if the task is deferred for future scheduling
         self.temporarily_deferred = False
+
+        # LCWRA planning metadata. These predicted values are written by
+        # schedulers for audit only; real start_time/finish_time keep their
+        # existing execution semantics.
+        self.planned_start_time: Optional[datetime] = None
+        self.planned_finish_time: Optional[datetime] = None
+        self.planned_dest_dc_id: Optional[int] = None
+        self.planned_low_carbon_window_start: Optional[datetime] = None
+        self.planned_low_carbon_window_end: Optional[datetime] = None
+        self.low_carbon_overlap_ratio: float = 0.0
+        self.reachable_lcw: bool = False
+        self.selected_plan_reason: Optional[str] = None
+        self.lcwra_selected_plan: Optional[Any] = None
+        self.lcwra_candidate_plans: list[Any] = []
+        self.transmission_accounted: bool = False
+        self.transmission_energy_kwh: float = 0.0
+        self.transmission_carbon_kg: float = 0.0
+        self.transmission_cost_usd: float = 0.0
         
         # Ensure unique identification by appending a random number
         self.job_name += f"_{random.randint(0, 10000)}"

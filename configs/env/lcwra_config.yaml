@@ -1,0 +1,11 @@
+lcwra:
+  horizon_steps: 32
+  timestep_minutes: 15
+  low_carbon_quantile: 0.25
+  min_window_steps: 1
+  min_lcw_overlap_ratio: 0.5
+  min_actual_lcw_overlap_ratio: 0.5
+  queue_wait_mode: "resource_simulation"
+  deadline_feasibility: true
+  objective: "predicted_marginal_system_carbon"
+  fallback_when_no_reachable_lcw: "lowest_predicted_marginal_system_carbon_feasible"

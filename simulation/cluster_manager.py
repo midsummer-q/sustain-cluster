@@ -4,12 +4,15 @@ import zipfile
 from collections import defaultdict
 from envs.sustaindc.sustaindc_env import SustainDC
 from utils.task_assignment_strategies import (DistributeMostAvailable, DistributeRandom, DistributePriorityOrder, DistributeLowestPrice, DistributeLeastPending, 
-                                                DistributeLowestCarbon, DistributeRoundRobin, DistributeLowestUtilization, BaseRBCStrategy, DistributeLocalOnly)
+                                                DistributeLowestCarbon, DistributeRoundRobin, DistributeLowestUtilization, BaseRBCStrategy, DistributeLocalOnly,
+                                                DistributeReachableLowCarbon)
 
 import numpy as np
 import pandas as pd
 from rl_components.task import Task
 
+from data.network_cost.network_delay import get_transmission_delay
+from utils.lcwra_audit import build_lcwra_audit_record
 from utils.transmission_cost_loader import load_transmission_matrix
 from utils.transmission_region_mapper import map_location_to_region
 from utils.workload_utils import assign_task_origins, extract_tasks_from_row
@@ -68,6 +71,8 @@ class DatacenterClusterManager:
         self.cloud_provider = cloud_provider
         self.transmission_matrix = load_transmission_matrix(cloud_provider)
         self.logger = logger
+        self.in_transit_tasks = []
+        self._transmission_metrics_this_step = {"cost": 0.0, "energy": 0.0, "emissions": 0.0}
 
         # Load tasks if a file path is provided; otherwise, self.tasks remains None
         # Load tasks with fallback unzip logic
@@ -89,6 +94,7 @@ class DatacenterClusterManager:
                             "lowest_price": DistributeLowestPrice(),
                             "lowest_utilization": DistributeLowestUtilization(),
                             "local_only": DistributeLocalOnly(),
+                            "reachable_low_carbon": DistributeReachableLowCarbon(),
                         }
 
     def reset(self, seed=None):
@@ -105,13 +111,13 @@ class DatacenterClusterManager:
             np.random.seed(seed)
             # print(f"Random seed set to {seed} for reproducibility.")
         rng = np.random.default_rng(seed)
-        # Limit day to ±7 days around the initial value, wrapping around the year (0-364)
+        # Limit day to 卤7 days around the initial value, wrapping around the year (0-364)
         low_day = max(0, self.init_day - 7)
         high_day = min(364, self.init_day + 7)
         self.random_init_day = int(rng.integers(low_day, high_day + 1))  # +1 because high is exclusive
 
         self.random_year = self.simulation_year
-        # You can keep full 0–23 hour range, or restrict it too if needed
+        # You can keep full 0鈥?3 hour range, or restrict it too if needed
         self.random_init_hour = int(rng.integers(0, 24))
 
         if self.shuffle_datacenter_order:
@@ -129,6 +135,7 @@ class DatacenterClusterManager:
         for strategy_obj in self.strategy_map.values():
             if isinstance(strategy_obj, BaseRBCStrategy): # Check if it's one of our classes
                 strategy_obj.reset()
+        self.in_transit_tasks.clear()
         # print("All datacenters have been reset.")
 
 
@@ -173,12 +180,20 @@ class DatacenterClusterManager:
             # Let the RL agent handle task assignment
             return None
         elif self.strategy in self.strategy_map:
-            assigned_dc_id = self.strategy_map[self.strategy](task, self.datacenters, logger)
+            assigned_dc_id = self.strategy_map[self.strategy](
+                task,
+                self.datacenters,
+                logger=logger,
+                current_time=current_time,
+                cluster_manager=self,
+            )
             assigned_dc = next((dc for dc in self.datacenters.values() if dc.dc_id == assigned_dc_id), None)
+            if not assigned_dc:
+                if logger:
+                    logger.warning(f"[{current_time}] Warning! Task {task.job_name} could not be assigned and remains in queue.")
+                return None
             task.dest_dc = assigned_dc
             task.dest_dc_id = assigned_dc.dc_id
-            if not assigned_dc:
-                logger.warning(f"[{current_time}] Warning! Task {task.job_name} could not be assigned and remains in queue.")
             return assigned_dc_id
         else:
             raise ValueError(f"Unknown strategy: {self.strategy}")
@@ -208,14 +223,19 @@ class DatacenterClusterManager:
         for dc in self.datacenters.values():
             dc._update_current_time_task(current_time)
 
+        self._transmission_metrics_this_step = {"cost": 0.0, "energy": 0.0, "emissions": 0.0}
+        arrived_transit_tasks = self._release_arrived_transit_tasks(current_time, logger)
+
         # Initialize the results dictionary
         results = {
             "energy_usage": {},
             "datacenter_infos": {},
             "task_distribution": defaultdict(list),  # Only used in rule-based mode
             "resource_usage": defaultdict(list),
-            "pending_task_count": {}
+            "pending_task_count": {},
+            "arrived_transit_tasks": arrived_transit_tasks,
             }
+        lcwra_audit_records_this_step = []
 
         # STEP 2. (Optional) Rule-based task routing
         if self.strategy != "manual_rl":
@@ -234,17 +254,29 @@ class DatacenterClusterManager:
                     if dc_name is None: # Safety check
                         if logger: logger.error(f"Could not find dc_name for assigned_dc_id {assigned_dc_id}")
                         continue # Skip this task if mapping fails
-                    self.datacenters[dc_name].pending_tasks.append(task)
                     task.dest_dc_id = assigned_dc_id
                     task.dest_dc = self.datacenters[dc_name]
+                    self._enqueue_rbc_task(task, dc_name, current_time, logger)
                     results["task_distribution"][dc_name].append(task)
+                    selected_plan = getattr(task, "lcwra_selected_plan", None)
+                    if selected_plan is not None:
+                        lcwra_audit_records_this_step.append(
+                            build_lcwra_audit_record(
+                                task,
+                                selected_plan,
+                                getattr(task, "lcwra_candidate_plans", []),
+                                actual_start_time=None,
+                                actual_finish_time=None,
+                                audit_stage="selected",
+                            )
+                        )
 
                     if logger:
                         logger.info(f"[{current_time}] Task {task.job_name} assigned -> {dc_name} (ID: {assigned_dc_id}) via RBC")
         else:
             # Manual RL mode: tasks have already been enqueued
             if logger:
-                logger.info(f"[{current_time}] Using manual RL mode — skipping internal task assignment")
+                logger.info(f"[{current_time}] Using manual RL mode 鈥?skipping internal task assignment")
 
         # STEP 3. Step each datacenter environment
         for dc_name, dc in self.datacenters.items():
@@ -256,6 +288,17 @@ class DatacenterClusterManager:
 
             # STEP 3.3: Record full info dict
             results["datacenter_infos"][dc_name] = info
+            for finished_task in info.get("__common__", {}).get("tasks_finished_this_step_objects", []):
+                selected_plan = getattr(finished_task, "lcwra_selected_plan", None)
+                if selected_plan is not None:
+                    lcwra_audit_records_this_step.append(
+                        build_lcwra_audit_record(
+                            finished_task,
+                            selected_plan,
+                            getattr(finished_task, "lcwra_candidate_plans", []),
+                            audit_stage="completed",
+                        )
+                    )
 
             # STEP 3.4: Track number of pending tasks
             results["pending_task_count"][dc_name] = len(dc.pending_tasks)
@@ -274,73 +317,19 @@ class DatacenterClusterManager:
                 logger.info(f"[{current_time}] {dc_name} - Running Tasks: {len(dc.running_tasks)}, "
                             f"Pending Tasks: {len(dc.pending_tasks)}")
 
-        # === STEP 4: Compute total transmission metrics ===
-        transmission_cost_total = 0.0
-        transmission_energy_total = 0.0
-        transmission_emissions_total = 0.0
+        # === STEP 4: Account transmission metrics not already recorded at routing time ===
 
         for dc_name, dc in self.datacenters.items():
             dc_info = results["datacenter_infos"][dc_name]
             routed_tasks = dc_info["__common__"].get("routed_tasks_this_step", [])
 
             for task in routed_tasks:
-                origin_loc = self.get_dc_location(task.origin_dc_id)
-                dest_loc = self.get_dc_location(task.dest_dc_id)
+                self._account_transmission_for_task(task, current_time, logger)
 
-                origin_region = map_location_to_region(origin_loc, self.cloud_provider)
-                dest_region = map_location_to_region(dest_loc, self.cloud_provider)
-
-                if origin_region and dest_region:
-                    try:
-                        cost_per_gb = self.transmission_matrix.loc[origin_region, dest_region]
-                        transmission_cost = cost_per_gb * task.bandwidth_gb
-                        transmission_cost_total += transmission_cost
-                        
-                        # === Compute transmission energy and emissions (Simpler model) ===
-                        kwh_per_gb = 0.06  # fixed intensity (KWh/GB) Extracted from https://onlinelibrary.wiley.com/doi/10.1111/jiec.12630
-                        energy_kwh_transmision = task.bandwidth_gb * kwh_per_gb
-                        task.origin_dc = next(dc for dc in self.datacenters.values() if dc.dc_id == task.origin_dc_id)
-                        ci_origin = task.origin_dc.ci_manager.get_current_ci(norm=False) / 1000  # in kgCO2/kWh
-
-                        # If there is no transmision (origin datacenter is the same as destination)
-                        if task.origin_dc_id == task.dest_dc_id:
-                            energy_kwh_transmision = 0.0
-                            ci_origin = 0.0
-                        
-                        transmission_emissions = energy_kwh_transmision * ci_origin
-                        transmission_energy_total += energy_kwh_transmision
-                        transmission_emissions_total += transmission_emissions
-                            
-                        if logger:
-                            origin_dc = task.origin_dc  # already assigned above
-                            logger.info(
-                                f"[{current_time}] Task '{task.job_name}' | "
-                                f"From {origin_dc.location} (ID={task.origin_dc_id}, Region={origin_region}) → "
-                                f"To {dest_loc} (ID={task.dest_dc_id}, Region={dest_region}) | "
-                                f"Bandwidth: {task.bandwidth_gb:.2f} GB | "
-                                f"Transmission Cost Rate: ${cost_per_gb:.2f}/GB | "
-                                f"Transmission Cost: ${transmission_cost:.4f} | "
-                                f"Transmission Energy Used: {energy_kwh_transmision:.4f} kWh | "
-                                f"Origin CI: {ci_origin:.4f} kgCO2/kWh | "
-                                f"Transmission CO2 Emissions: {transmission_emissions:.4f} kgCO₂"
-                            )
-
-                    except KeyError:
-                        print(f"[WARNING] Transmission cost not found between {origin_region} and {dest_region}")
-                
-                else:
-                    if logger:
-                        logger.warning(
-                            f"[{current_time}] Unknown region mapping for {origin_loc} (ID={task.origin_dc_id}) "
-                            f"or {dest_loc} (ID={task.dest_dc_id})"
-                        )
-                    raise ValueError(
-                        f"Unknown region mapping for {origin_loc} (ID={task.origin_dc_id}) or {dest_loc} (ID={task.dest_dc_id})"
-                    )
-
-        results["transmission_cost_total_usd"] = transmission_cost_total
-        results["transmission_energy_total_kwh"] = transmission_energy_total
-        results["transmission_emissions_total_kg"] = transmission_emissions_total
+        results["transmission_cost_total_usd"] = self._transmission_metrics_this_step["cost"]
+        results["transmission_energy_total_kwh"] = self._transmission_metrics_this_step["energy"]
+        results["transmission_emissions_total_kg"] = self._transmission_metrics_this_step["emissions"]
+        results["lcwra_audit_records_this_step"] = lcwra_audit_records_this_step
 
         system_metrics = aggregate_system_metrics(results)
         results.update(system_metrics)
@@ -353,6 +342,100 @@ class DatacenterClusterManager:
             if dc.dc_id == dc_id:
                 return dc.location
         return None
+
+    def _release_arrived_transit_tasks(self, current_time, logger=None):
+        arrived = []
+        remaining = []
+        for arrival_time, task, dc_name in self.in_transit_tasks:
+            if arrival_time <= current_time:
+                self.datacenters[dc_name].pending_tasks.append(task)
+                arrived.append(task)
+                if logger:
+                    logger.info(f"[{current_time}] RBC task {task.job_name} arrived at {dc_name}")
+            else:
+                remaining.append((arrival_time, task, dc_name))
+        self.in_transit_tasks = remaining
+        return arrived
+
+    def _enqueue_rbc_task(self, task, dc_name, current_time, logger=None):
+        dest_dc = self.datacenters[dc_name]
+        self._account_transmission_for_task(task, current_time, logger)
+        if task.origin_dc_id == task.dest_dc_id:
+            dest_dc.pending_tasks.append(task)
+            return
+
+        origin_loc = self.get_dc_location(task.origin_dc_id)
+        dest_loc = dest_dc.location
+        delay_s = get_transmission_delay(origin_loc, dest_loc, self.cloud_provider, task.bandwidth_gb)
+        arrival_time = current_time + pd.to_timedelta(max(0.0, delay_s), unit="s")
+        if arrival_time <= current_time:
+            dest_dc.pending_tasks.append(task)
+        else:
+            self.in_transit_tasks.append((arrival_time, task, dc_name))
+            if logger:
+                logger.info(
+                    f"[{current_time}] RBC task {task.job_name} in transit to {dc_name}; "
+                    f"arrival={arrival_time}, delay={delay_s:.2f}s"
+                )
+
+    def _account_transmission_for_task(self, task, current_time, logger=None):
+        if getattr(task, "transmission_accounted", False):
+            return
+
+        transmission_cost = 0.0
+        transmission_energy_kwh = 0.0
+        transmission_emissions_kg = 0.0
+
+        if task.origin_dc_id != task.dest_dc_id:
+            origin_loc = self.get_dc_location(task.origin_dc_id)
+            dest_loc = self.get_dc_location(task.dest_dc_id)
+            origin_region = map_location_to_region(origin_loc, self.cloud_provider)
+            dest_region = map_location_to_region(dest_loc, self.cloud_provider)
+
+            if not origin_region or not dest_region:
+                message = (
+                    f"Unknown region mapping for {origin_loc} (ID={task.origin_dc_id}) "
+                    f"or {dest_loc} (ID={task.dest_dc_id})"
+                )
+                if logger:
+                    logger.warning(f"[{current_time}] {message}")
+                raise ValueError(message)
+
+            try:
+                cost_per_gb = self.transmission_matrix.loc[origin_region, dest_region]
+            except KeyError:
+                cost_per_gb = 0.0
+                if logger:
+                    logger.warning(
+                        f"[{current_time}] Transmission cost not found between "
+                        f"{origin_region} and {dest_region}; using 0.0"
+                    )
+
+            transmission_cost = float(cost_per_gb) * float(task.bandwidth_gb)
+            transmission_energy_kwh = float(task.bandwidth_gb) * 0.06
+            origin_dc = next(dc for dc in self.datacenters.values() if dc.dc_id == task.origin_dc_id)
+            task.origin_dc = origin_dc
+            ci_origin = origin_dc.ci_manager.get_current_ci(norm=False) / 1000.0
+            transmission_emissions_kg = transmission_energy_kwh * ci_origin
+
+            if logger:
+                logger.info(
+                    f"[{current_time}] Task '{task.job_name}' transmission accounted | "
+                    f"From {origin_loc} (ID={task.origin_dc_id}, Region={origin_region}) -> "
+                    f"To {dest_loc} (ID={task.dest_dc_id}, Region={dest_region}) | "
+                    f"Bandwidth: {task.bandwidth_gb:.2f} GB | "
+                    f"Cost: ${transmission_cost:.4f} | "
+                    f"Energy: {transmission_energy_kwh:.4f} kWh | "
+                    f"CO2: {transmission_emissions_kg:.4f} kg"
+                )
+
+        task.transmission_accounted = True
+        task.transmission_cost_usd = transmission_cost
+        task.transmission_energy_kwh = transmission_energy_kwh
+        task.transmission_carbon_kg = transmission_emissions_kg
+        self._transmission_metrics_this_step["cost"] += transmission_cost
+        self._transmission_metrics_this_step["energy"] += transmission_energy_kwh
+        self._transmission_metrics_this_step["emissions"] += transmission_emissions_kg
 
 
     def get_config_list(self):

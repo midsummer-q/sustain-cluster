@@ -387,6 +387,7 @@ class TaskSchedulingEnv(gym.Env):
             "transmission_emissions_total_kg": results.get("transmission_emissions_total_kg", 0.0),
             "task_distribution": results.get("task_distribution", {}),
             "current_tasks_this_step": current_tasks_this_step,
+            "lcwra_audit_records_this_step": results.get("lcwra_audit_records_this_step", []),
         }
         info.update({
             key: results[key]

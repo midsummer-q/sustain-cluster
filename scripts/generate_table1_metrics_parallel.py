@@ -59,6 +59,21 @@ FACILITY_CARBON_COLUMNS = [
     "sla_violation_rate",
 ]
 
+LCWRA_COLUMNS = [
+    "reachable_lcw_selection_rate",
+    "avg_planned_low_carbon_overlap_ratio",
+    "avg_actual_low_carbon_overlap_ratio",
+    "avg_low_carbon_overlap_error",
+    "actual_low_carbon_miss_rate",
+    "low_carbon_miss_rate",
+    "avg_low_carbon_overlap_ratio",
+    "planned_start_mae_min",
+    "planned_finish_mae_min",
+    "lcwra_selected_count",
+    "lcwra_completed_count",
+    "lcwra_completion_coverage",
+]
+
 # Define controllers for Table 1
 CONTROLLERS_TO_EVALUATE = [
     {
@@ -88,6 +103,11 @@ CONTROLLERS_TO_EVALUATE = [
     {
         "name": "RBC (Lowest Carbon)",
         "strategy": "lowest_carbon",
+        "is_rl": False,
+    },
+    {
+        "name": "RBC (Reachable Low Carbon)",
+        "strategy": "reachable_low_carbon",
         "is_rl": False,
     },
     {
@@ -131,6 +151,9 @@ results_csv_path = os.path.join(log_dir, f"results_table1_{timestamp}.csv")
 facility_output_dir = os.path.join("outputs", "facility_carbon_baselines")
 facility_summary_csv_path = os.path.join(facility_output_dir, "controller_summary.csv")
 facility_raw_csv_path = os.path.join(facility_output_dir, "controller_summary_raw.csv")
+lcwra_output_dir = os.path.join("outputs", "lcwra_baselines")
+lcwra_summary_csv_path = os.path.join(lcwra_output_dir, "controller_summary.csv")
+lcwra_audit_csv_path = os.path.join(lcwra_output_dir, "lcwra_audit.csv")
 
 logger = logging.getLogger("table1_eval_logger")
 logger.setLevel(logging.INFO)
@@ -151,7 +174,7 @@ def _legacy_task_carbon_for_tasks(tasks):
         dest_dc = getattr(task, "dest_dc", None)
         if dest_dc:
             task_energy = task.cores_req * task.duration / 10000.0
-            task_emissions = task_energy * dest_dc.ci_manager.get_current_ci(norm=False)
+            task_emissions = task_energy * dest_dc.ci_manager.get_current_ci(norm=False) / 1000.0
             total_task_emissions += task_emissions
     return total_task_emissions
 
@@ -252,6 +275,7 @@ def run_single_evaluation(controller_config, seed, base_sim_cfg, base_dc_cfg, ba
     obs, _ = env.reset(seed=seed) # Reset again to ensure consistent start
     num_steps = EVALUATION_DURATION_DAYS * 24 * 4 # 15-min intervals
     all_infos = [] # Store info dict from each step
+    lcwra_audit_records = []
     total_deferred_tasks_count = 0 # <<<--- Initialize deferred count
 
     for step in range(num_steps):
@@ -299,6 +323,10 @@ def run_single_evaluation(controller_config, seed, base_sim_cfg, base_dc_cfg, ba
         # try:
         obs, _, done, truncated, info = env.step(actions)
         all_infos.append(info) # Store the entire info dict
+        for record in info.get("lcwra_audit_records_this_step", []):
+            record["Controller"] = controller_config["name"]
+            record["Seed"] = seed
+            lcwra_audit_records.append(record)
         if done or truncated:
             #logger.info(f"Episode finished early at step {step+1} for seed {seed}.")
             # break # Stop if the environment finishes based on Time_Manager duration
@@ -333,6 +361,7 @@ def run_single_evaluation(controller_config, seed, base_sim_cfg, base_dc_cfg, ba
     gpu_utils = []
     mem_utils = []
     facility_metrics = {column: 0.0 for column in FACILITY_CARBON_COLUMNS}
+    lcwra_metrics = _summarize_lcwra_audit_records(lcwra_audit_records)
 
     for step_info in all_infos:
         total_trans_cost += step_info.get("transmission_cost_total_usd", 0.0)
@@ -399,8 +428,76 @@ def run_single_evaluation(controller_config, seed, base_sim_cfg, base_dc_cfg, ba
         "Total Tasks Deferred": total_deferred_tasks_count, # Use accumulated count
     }
     results.update(facility_metrics)
+    results.update(lcwra_metrics)
     logger.info(f"--- Finished Eval: {controller_config['name']} | Seed: {seed} ---")
-    return results
+    return results, lcwra_audit_records
+
+
+def _summarize_lcwra_audit_records(records):
+    if not records:
+        return {column: np.nan for column in LCWRA_COLUMNS}
+
+    selected_records = [record for record in records if record.get("audit_stage") == "selected"]
+    completed_records = [record for record in records if record.get("audit_stage") == "completed"]
+    if not selected_records and not completed_records:
+        selected_records = records
+        completed_records = records
+
+    selected_count = len(selected_records)
+    completed_count = len(completed_records)
+
+    reachable_flags = [bool(record.get("reachable_lcw", False)) for record in selected_records]
+    planned_overlaps = [
+        float(record.get("planned_low_carbon_overlap_ratio", record.get("low_carbon_overlap_ratio", 0.0)) or 0.0)
+        for record in selected_records
+    ]
+    actual_overlaps = [
+        float(record["actual_low_carbon_overlap_ratio"])
+        for record in completed_records
+        if record.get("actual_low_carbon_overlap_ratio") is not None
+    ]
+    overlap_errors = [
+        float(record["low_carbon_overlap_error"])
+        for record in completed_records
+        if record.get("low_carbon_overlap_error") is not None
+    ]
+    actual_missed_flags = [
+        bool(record.get("actual_low_carbon_missed", record.get("low_carbon_missed")))
+        for record in completed_records
+        if record.get("actual_low_carbon_missed", record.get("low_carbon_missed")) is not None
+    ]
+    start_errors = [
+        abs(float(record["plan_start_error_min"]))
+        for record in completed_records
+        if record.get("plan_start_error_min") is not None
+    ]
+    finish_errors = [
+        abs(float(record["plan_finish_error_min"]))
+        for record in completed_records
+        if record.get("plan_finish_error_min") is not None
+    ]
+
+    reachable_rate = float(np.mean(reachable_flags)) if reachable_flags else np.nan
+    planned_overlap = float(np.mean(planned_overlaps)) if planned_overlaps else np.nan
+    actual_overlap = float(np.mean(actual_overlaps)) if actual_overlaps else np.nan
+    overlap_error = float(np.mean(overlap_errors)) if overlap_errors else np.nan
+    actual_miss_rate = float(np.mean(actual_missed_flags)) if actual_missed_flags else np.nan
+    completion_coverage = completed_count / selected_count if selected_count else np.nan
+
+    return {
+        "reachable_lcw_selection_rate": reachable_rate,
+        "avg_planned_low_carbon_overlap_ratio": planned_overlap,
+        "avg_actual_low_carbon_overlap_ratio": actual_overlap,
+        "avg_low_carbon_overlap_error": overlap_error,
+        "actual_low_carbon_miss_rate": actual_miss_rate,
+        "low_carbon_miss_rate": actual_miss_rate,
+        "avg_low_carbon_overlap_ratio": planned_overlap,
+        "planned_start_mae_min": float(np.mean(start_errors)) if start_errors else np.nan,
+        "planned_finish_mae_min": float(np.mean(finish_errors)) if finish_errors else np.nan,
+        "lcwra_selected_count": selected_count,
+        "lcwra_completed_count": completed_count,
+        "lcwra_completion_coverage": completion_coverage,
+    }
 
 
 # --- Main: load configs once, then parallelize seeds per controller ---
@@ -420,6 +517,7 @@ if __name__ == "__main__":
     ]
 
     all_results = []
+    all_lcwra_audit_records = []
     max_workers = min(len(tasks), os.cpu_count())
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -439,9 +537,14 @@ if __name__ == "__main__":
         for fut in as_completed(futures):
             name, seed = futures[fut]
             try:
-                res = fut.result()
+                payload = fut.result()
+                if isinstance(payload, tuple):
+                    res, audit_records = payload
+                else:
+                    res, audit_records = payload, []
                 if res:
                     all_results.append(res)
+                    all_lcwra_audit_records.extend(audit_records)
                 else:
                     logger.warning(f"no result {name} seed {seed}")
             except Exception as e:
@@ -482,6 +585,18 @@ if __name__ == "__main__":
             "finished_tasks_count": ['mean', 'std'],
             "sla_violation_count": ['mean', 'std'],
             "sla_violation_rate": ['mean', 'std'],
+            "reachable_lcw_selection_rate": ['mean', 'std'],
+            "avg_planned_low_carbon_overlap_ratio": ['mean', 'std'],
+            "avg_actual_low_carbon_overlap_ratio": ['mean', 'std'],
+            "avg_low_carbon_overlap_error": ['mean', 'std'],
+            "actual_low_carbon_miss_rate": ['mean', 'std'],
+            "low_carbon_miss_rate": ['mean', 'std'],
+            "avg_low_carbon_overlap_ratio": ['mean', 'std'],
+            "planned_start_mae_min": ['mean', 'std'],
+            "planned_finish_mae_min": ['mean', 'std'],
+            "lcwra_selected_count": ['mean', 'std'],
+            "lcwra_completed_count": ['mean', 'std'],
+            "lcwra_completion_coverage": ['mean', 'std'],
         }
     )
     
@@ -536,14 +651,19 @@ if __name__ == "__main__":
     # Save raw results and summary
     try:
         os.makedirs(facility_output_dir, exist_ok=True)
+        os.makedirs(lcwra_output_dir, exist_ok=True)
         results_df.to_csv(results_csv_path.replace(".csv", "_raw.csv"), index=False)
         formatted_summary_df.to_csv(results_csv_path, index=False)
         results_df.to_csv(facility_raw_csv_path, index=False)
         formatted_summary_df.to_csv(facility_summary_csv_path, index=False)
+        formatted_summary_df.to_csv(lcwra_summary_csv_path, index=False)
+        pd.DataFrame(all_lcwra_audit_records).to_csv(lcwra_audit_csv_path, index=False)
         logger.info(f"Raw results saved to {results_csv_path.replace('.csv', '_raw.csv')}")
         logger.info(f"Formatted summary saved to {results_csv_path}")
         logger.info(f"Facility carbon raw results saved to {facility_raw_csv_path}")
         logger.info(f"Facility carbon summary saved to {facility_summary_csv_path}")
+        logger.info(f"LCWRA summary saved to {lcwra_summary_csv_path}")
+        logger.info(f"LCWRA audit saved to {lcwra_audit_csv_path}")
     except Exception as e:
         logger.error(f"Error saving results to CSV: {e}")
 
@@ -552,3 +672,5 @@ if __name__ == "__main__":
     print(f"\nFull logs saved to: {log_path}")
     print(f"CSV results saved to directory: {log_dir}")
     print(f"Facility carbon summary saved to: {facility_summary_csv_path}")
+    print(f"LCWRA summary saved to: {lcwra_summary_csv_path}")
+    print(f"LCWRA audit saved to: {lcwra_audit_csv_path}")
