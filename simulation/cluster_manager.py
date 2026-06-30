@@ -13,6 +13,7 @@ from rl_components.task import Task
 from utils.transmission_cost_loader import load_transmission_matrix
 from utils.transmission_region_mapper import map_location_to_region
 from utils.workload_utils import assign_task_origins, extract_tasks_from_row
+from utils.system_metrics import aggregate_system_metrics
 
 class DatacenterClusterManager:
     """
@@ -341,6 +342,8 @@ class DatacenterClusterManager:
         results["transmission_energy_total_kwh"] = transmission_energy_total
         results["transmission_emissions_total_kg"] = transmission_emissions_total
 
+        system_metrics = aggregate_system_metrics(results)
+        results.update(system_metrics)
 
         # FINAL STEP. Return aggregated results from all datacenters
         return results

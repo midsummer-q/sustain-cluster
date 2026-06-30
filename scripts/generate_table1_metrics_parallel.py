@@ -1,5 +1,12 @@
 # generate_table1_metrics.py
 
+import os
+import sys
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import torch
 import pandas as pd
 import numpy as np
@@ -19,7 +26,6 @@ from utils.config_logger import setup_logger # Assuming setup_logger exists
 import datetime
 import logging
 import random
-import os
 import copy # For deep copying config dicts
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -36,6 +42,22 @@ DEFAULT_RL_CHECKPOINT_PATH = "../checkpoints/train_20250516_165831/checkpoint_st
 EVALUATION_DURATION_DAYS = 7 # Use 1 month for evaluation
 NUM_SEEDS = 10 # Number of random seeds to run for each controller
 SEEDS = [i * 10 for i in range(NUM_SEEDS)] # Example: [0, 10, 20, 30, 40]
+
+FACILITY_CARBON_COLUMNS = [
+    "legacy_task_carbon_kg",
+    "total_dc_carbon_emissions_kg",
+    "total_transmission_carbon_emissions_kg",
+    "total_system_carbon_emissions_kg",
+    "total_dc_energy_kwh",
+    "total_transmission_energy_kwh",
+    "total_system_energy_kwh",
+    "total_dc_energy_cost_usd",
+    "total_transmission_cost_usd",
+    "total_system_energy_cost_usd",
+    "finished_tasks_count",
+    "sla_violation_count",
+    "sla_violation_rate",
+]
 
 # Define controllers for Table 1
 CONTROLLERS_TO_EVALUATE = [
@@ -84,6 +106,11 @@ CONTROLLERS_TO_EVALUATE = [
         "is_rl": False,
     },
     {
+        "name": "RBC (Least Pending)",
+        "strategy": "least_pending",
+        "is_rl": False,
+    },
+    {
         "name": "RBC (Local Only)",
         "strategy": "local_only",
         "is_rl": False,
@@ -101,6 +128,9 @@ log_dir = f"logs/table1_eval_{timestamp}"
 os.makedirs(log_dir, exist_ok=True)
 log_path = os.path.join(log_dir, f"evaluation_table1_{timestamp}.log")
 results_csv_path = os.path.join(log_dir, f"results_table1_{timestamp}.csv")
+facility_output_dir = os.path.join("outputs", "facility_carbon_baselines")
+facility_summary_csv_path = os.path.join(facility_output_dir, "controller_summary.csv")
+facility_raw_csv_path = os.path.join(facility_output_dir, "controller_summary_raw.csv")
 
 logger = logging.getLogger("table1_eval_logger")
 logger.setLevel(logging.INFO)
@@ -112,6 +142,30 @@ console_handler.setLevel(logging.WARNING)
 console_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
+
+
+def _legacy_task_carbon_for_tasks(tasks):
+    """Match the legacy carbon_emissions reward's task-level proxy formula."""
+    total_task_emissions = 0.0
+    for task in tasks:
+        dest_dc = getattr(task, "dest_dc", None)
+        if dest_dc:
+            task_energy = task.cores_req * task.duration / 10000.0
+            task_emissions = task_energy * dest_dc.ci_manager.get_current_ci(norm=False)
+            total_task_emissions += task_emissions
+    return total_task_emissions
+
+
+def _legacy_task_carbon_for_step(step_info):
+    current_tasks = step_info.get("current_tasks_this_step") or []
+    if current_tasks:
+        return _legacy_task_carbon_for_tasks(current_tasks)
+
+    task_distribution = step_info.get("task_distribution") or {}
+    distributed_tasks = []
+    for tasks in task_distribution.values():
+        distributed_tasks.extend(tasks)
+    return _legacy_task_carbon_for_tasks(distributed_tasks)
 
 
 # --- Environment Creation Function (Modified) ---
@@ -278,9 +332,23 @@ def run_single_evaluation(controller_config, seed, base_sim_cfg, base_dc_cfg, ba
     cpu_utils = []
     gpu_utils = []
     mem_utils = []
+    facility_metrics = {column: 0.0 for column in FACILITY_CARBON_COLUMNS}
 
     for step_info in all_infos:
         total_trans_cost += step_info.get("transmission_cost_total_usd", 0.0)
+        facility_metrics["legacy_task_carbon_kg"] += _legacy_task_carbon_for_step(step_info)
+        facility_metrics["total_dc_carbon_emissions_kg"] += step_info.get("total_dc_carbon_emissions_kg", 0.0)
+        facility_metrics["total_transmission_carbon_emissions_kg"] += step_info.get("total_transmission_carbon_emissions_kg", 0.0)
+        facility_metrics["total_system_carbon_emissions_kg"] += step_info.get("total_system_carbon_emissions_kg", 0.0)
+        facility_metrics["total_dc_energy_kwh"] += step_info.get("total_dc_energy_kwh", 0.0)
+        facility_metrics["total_transmission_energy_kwh"] += step_info.get("total_transmission_energy_kwh", 0.0)
+        facility_metrics["total_system_energy_kwh"] += step_info.get("total_system_energy_kwh", 0.0)
+        facility_metrics["total_dc_energy_cost_usd"] += step_info.get("total_dc_energy_cost_usd", 0.0)
+        facility_metrics["total_transmission_cost_usd"] += step_info.get("total_transmission_cost_usd", 0.0)
+        facility_metrics["total_system_energy_cost_usd"] += step_info.get("total_system_energy_cost_usd", 0.0)
+        facility_metrics["finished_tasks_count"] += step_info.get("finished_tasks_count", 0)
+        facility_metrics["sla_violation_count"] += step_info.get("sla_violation_count", 0)
+
         for dc_name, dc_info in step_info.get("datacenter_infos", {}).items():
             common = dc_info.get("__common__", {})
             sla = common.get("__sla__", {})
@@ -306,6 +374,10 @@ def run_single_evaluation(controller_config, seed, base_sim_cfg, base_dc_cfg, ba
     total_tasks_finished = total_sla_met + total_sla_violated
     sla_violation_rate = (total_sla_violated / total_tasks_finished * 100) if total_tasks_finished > 0 else 0.0
     average_pue = total_energy_kwh / total_ite_energy_kwh if total_ite_energy_kwh > 0 else np.nan # Use NaN if no IT energy
+    facility_metrics["sla_violation_rate"] = (
+        facility_metrics["sla_violation_count"] / facility_metrics["finished_tasks_count"]
+        if facility_metrics["finished_tasks_count"] > 0 else 0.0
+    )
     
     # *** Convert total water usage to m³ ***
     total_water_usage_m3 = total_water_usage_L / 1000.0
@@ -326,6 +398,7 @@ def run_single_evaluation(controller_config, seed, base_sim_cfg, base_dc_cfg, ba
         "Average PUE": average_pue,
         "Total Tasks Deferred": total_deferred_tasks_count, # Use accumulated count
     }
+    results.update(facility_metrics)
     logger.info(f"--- Finished Eval: {controller_config['name']} | Seed: {seed} ---")
     return results
 
@@ -396,6 +469,19 @@ if __name__ == "__main__":
             "Total Water Usage (m3)": ['mean', 'std'], # <<<--- UPDATED KEY
             "Average PUE": ['mean', 'std'],          # <<<--- ADDED
             "Total Tasks Deferred": ['mean', 'std'],   # <<<--- ADDED
+            "legacy_task_carbon_kg": ['mean', 'std'],
+            "total_dc_carbon_emissions_kg": ['mean', 'std'],
+            "total_transmission_carbon_emissions_kg": ['mean', 'std'],
+            "total_system_carbon_emissions_kg": ['mean', 'std'],
+            "total_dc_energy_kwh": ['mean', 'std'],
+            "total_transmission_energy_kwh": ['mean', 'std'],
+            "total_system_energy_kwh": ['mean', 'std'],
+            "total_dc_energy_cost_usd": ['mean', 'std'],
+            "total_transmission_cost_usd": ['mean', 'std'],
+            "total_system_energy_cost_usd": ['mean', 'std'],
+            "finished_tasks_count": ['mean', 'std'],
+            "sla_violation_count": ['mean', 'std'],
+            "sla_violation_rate": ['mean', 'std'],
         }
     )
     
@@ -449,10 +535,15 @@ if __name__ == "__main__":
 
     # Save raw results and summary
     try:
+        os.makedirs(facility_output_dir, exist_ok=True)
         results_df.to_csv(results_csv_path.replace(".csv", "_raw.csv"), index=False)
         formatted_summary_df.to_csv(results_csv_path, index=False)
+        results_df.to_csv(facility_raw_csv_path, index=False)
+        formatted_summary_df.to_csv(facility_summary_csv_path, index=False)
         logger.info(f"Raw results saved to {results_csv_path.replace('.csv', '_raw.csv')}")
         logger.info(f"Formatted summary saved to {results_csv_path}")
+        logger.info(f"Facility carbon raw results saved to {facility_raw_csv_path}")
+        logger.info(f"Facility carbon summary saved to {facility_summary_csv_path}")
     except Exception as e:
         logger.error(f"Error saving results to CSV: {e}")
 
@@ -460,3 +551,4 @@ if __name__ == "__main__":
     print(formatted_summary_df.to_string(index=False))
     print(f"\nFull logs saved to: {log_path}")
     print(f"CSV results saved to directory: {log_dir}")
+    print(f"Facility carbon summary saved to: {facility_summary_csv_path}")

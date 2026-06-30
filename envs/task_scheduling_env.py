@@ -254,6 +254,7 @@ class TaskSchedulingEnv(gym.Env):
 
     def step(self, actions): # actions is a single int if single_action_mode else list
         # ... (existing in_transit_tasks logic) ...
+        current_tasks_this_step = list(self.current_tasks)
         remaining_in_transit = []
         for arrival_time, task, dc_name in self.in_transit_tasks:
             if arrival_time <= self.current_time:
@@ -382,7 +383,30 @@ class TaskSchedulingEnv(gym.Env):
             "scheduled_tasks_this_step": processed_actions_count, # How many actions were processed
             "datacenter_infos": results["datacenter_infos"],
             "transmission_cost_total_usd" : results["transmission_cost_total_usd"],
+            "transmission_energy_total_kwh": results.get("transmission_energy_total_kwh", 0.0),
+            "transmission_emissions_total_kg": results.get("transmission_emissions_total_kg", 0.0),
+            "task_distribution": results.get("task_distribution", {}),
+            "current_tasks_this_step": current_tasks_this_step,
         }
+        info.update({
+            key: results[key]
+            for key in (
+                "total_dc_energy_kwh",
+                "total_dc_carbon_emissions_kg",
+                "total_dc_energy_cost_usd",
+                "total_transmission_energy_kwh",
+                "total_transmission_carbon_emissions_kg",
+                "total_transmission_cost_usd",
+                "total_system_energy_kwh",
+                "total_system_carbon_emissions_kg",
+                "total_system_energy_cost_usd",
+                "finished_tasks_count",
+                "sla_met_count",
+                "sla_violation_count",
+                "sla_violation_rate",
+            )
+            if key in results
+        })
         return obs_next, reward, done, truncated, info
     
 

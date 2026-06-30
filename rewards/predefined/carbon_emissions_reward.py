@@ -3,6 +3,13 @@ from rewards.registry_utils import register_reward
 
 @register_reward("carbon_emissions")
 class CarbonEmissionsReward(BaseReward):
+    """
+    Legacy task-level carbon proxy.
+
+    This reward estimates emissions from scheduled task attributes and the
+    destination datacenter's current carbon intensity. It is retained for
+    comparison with system-level facility-aware carbon metrics.
+    """
     def __init__(self, normalize_factor: float = 100.0):
         super().__init__()
         self.normalize_factor = normalize_factor
