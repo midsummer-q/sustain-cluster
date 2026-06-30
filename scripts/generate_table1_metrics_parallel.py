@@ -22,6 +22,7 @@ from simulation.cluster_manager import DatacenterClusterManager
 from utils.config_loader import load_yaml
 from rewards.predefined.composite_reward import CompositeReward
 from utils.config_logger import setup_logger # Assuming setup_logger exists
+from utils.lcwra_audit import build_lcwra_audit_record
 
 import datetime
 import logging
@@ -72,7 +73,16 @@ LCWRA_COLUMNS = [
     "avg_deadline_slack_min",
     "sla_safe_selection_rate",
     "avg_sla_risk_score",
+    "selected_plan_rejected_by_sla_guard_rate",
+    "any_candidate_rejected_by_sla_guard_rate",
+    "candidate_rejected_by_sla_guard_rate",
     "rejected_by_sla_guard_rate",
+    "lcwra_unfinished_count",
+    "lcwra_unfinished_rate",
+    "lcwra_deadline_expired_unfinished_count",
+    "lcwra_deadline_expired_unfinished_rate",
+    "completed_only_low_carbon_miss_rate",
+    "all_selected_low_carbon_miss_or_unfinished_rate",
     "lcwra_selected_count",
     "lcwra_completed_count",
     "lcwra_completion_coverage",
@@ -335,6 +345,14 @@ def run_single_evaluation(controller_config, seed, base_sim_cfg, base_dc_cfg, ba
         logger.warning(f"No info collected for {controller_config['name']}, seed {seed}.")
         return None
 
+    unfinished_records = collect_unfinished_lcwra_audit_records(
+        env,
+        controller_config["name"],
+        seed,
+        getattr(env, "end_time", None),
+    )
+    lcwra_audit_records.extend(unfinished_records)
+
     total_energy_cost = 0.0
     total_energy_kwh = 0.0
     total_carbon_kg = 0.0
@@ -419,18 +437,72 @@ def run_single_evaluation(controller_config, seed, base_sim_cfg, base_dc_cfg, ba
     return results, lcwra_audit_records
 
 
+def collect_unfinished_lcwra_audit_records(env, controller_name, seed, end_time):
+    records = []
+    seen_task_ids = set()
+    cluster_manager = getattr(env, "cluster_manager", None)
+
+    def add_task(task, location, dest_dc=None):
+        if task is None or not hasattr(task, "lcwra_selected_plan"):
+            return
+        selected_plan = getattr(task, "lcwra_selected_plan", None)
+        if selected_plan is None:
+            return
+        identity = id(task)
+        if identity in seen_task_ids:
+            return
+        seen_task_ids.add(identity)
+        record = build_lcwra_audit_record(
+            task,
+            selected_plan,
+            getattr(task, "lcwra_candidate_plans", []),
+            actual_start_time=getattr(task, "start_time", None),
+            actual_finish_time=getattr(task, "finish_time", None),
+            audit_stage="unfinished",
+            dest_dc=dest_dc,
+            config=getattr(task, "lcwra_config", None),
+            unfinished_location=location,
+            episode_end_time=end_time,
+        )
+        record["Controller"] = controller_name
+        record["Seed"] = seed
+        records.append(record)
+
+    if cluster_manager is not None:
+        for dc in getattr(cluster_manager, "datacenters", {}).values():
+            for task in list(getattr(dc, "pending_tasks", [])):
+                add_task(task, "pending", dest_dc=dc)
+            for task in list(getattr(dc, "running_tasks", [])):
+                add_task(task, "running", dest_dc=dc)
+
+        for _, task, dc_name in list(getattr(cluster_manager, "in_transit_tasks", [])):
+            dest_dc = getattr(cluster_manager, "datacenters", {}).get(dc_name)
+            add_task(task, "in_transit", dest_dc=dest_dc)
+
+    for _, task, dc_name in list(getattr(env, "in_transit_tasks", [])):
+        dest_dc = getattr(getattr(env, "cluster_manager", None), "datacenters", {}).get(dc_name)
+        add_task(task, "in_transit", dest_dc=dest_dc)
+
+    for task in list(getattr(env, "deferred_tasks", [])):
+        add_task(task, "deferred", dest_dc=getattr(task, "dest_dc", None))
+
+    return records
+
+
 def _summarize_lcwra_audit_records(records):
     if not records:
         return {column: np.nan for column in LCWRA_COLUMNS}
 
     selected_records = [record for record in records if record.get("audit_stage") == "selected"]
     completed_records = [record for record in records if record.get("audit_stage") == "completed"]
+    unfinished_records = [record for record in records if record.get("audit_stage") == "unfinished"]
     if not selected_records and not completed_records:
         selected_records = records
         completed_records = records
 
     selected_count = len(selected_records)
     completed_count = len(completed_records)
+    unfinished_count = len(unfinished_records)
 
     reachable_flags = [bool(record.get("reachable_lcw", False)) for record in selected_records]
     planned_overlaps = [
@@ -476,17 +548,42 @@ def _summarize_lcwra_audit_records(records):
         for record in selected_records
         if record.get("sla_risk_score") is not None
     ]
-    rejected_by_guard_flags = [
-        bool(record.get("any_candidate_rejected_by_sla_guard", record.get("rejected_by_sla_guard", False)))
+    selected_plan_rejected_flags = [
+        bool(record.get("rejected_by_sla_guard", False))
         for record in selected_records
+    ]
+    any_candidate_rejected_flags = [
+        bool(record.get("any_candidate_rejected_by_sla_guard", False))
+        for record in selected_records
+    ]
+    rejected_candidate_count = sum(
+        int(record.get("rejected_by_sla_guard_candidate_count", 0) or 0)
+        for record in selected_records
+    )
+    candidate_count = sum(
+        int(record.get("candidate_count", 0) or 0)
+        for record in selected_records
+    )
+    deadline_expired_unfinished_flags = [
+        bool(record.get("sla_deadline_expired_at_episode_end", False))
+        for record in unfinished_records
     ]
 
     reachable_rate = float(np.mean(reachable_flags)) if reachable_flags else np.nan
     planned_overlap = float(np.mean(planned_overlaps)) if planned_overlaps else np.nan
     actual_overlap = float(np.mean(actual_overlaps)) if actual_overlaps else np.nan
     overlap_error = float(np.mean(overlap_errors)) if overlap_errors else np.nan
-    actual_miss_rate = float(np.mean(actual_missed_flags)) if actual_missed_flags else np.nan
+    completed_only_miss_rate = float(np.mean(actual_missed_flags)) if actual_missed_flags else np.nan
+    actual_miss_rate = completed_only_miss_rate
     completion_coverage = completed_count / selected_count if selected_count else np.nan
+    expired_unfinished_count = int(sum(deadline_expired_unfinished_flags))
+    all_selected_miss_or_unfinished_rate = (
+        (int(sum(actual_missed_flags)) + unfinished_count) / selected_count
+        if selected_count else np.nan
+    )
+    any_candidate_rejected_rate = (
+        float(np.mean(any_candidate_rejected_flags)) if any_candidate_rejected_flags else np.nan
+    )
 
     return {
         "reachable_lcw_selection_rate": reachable_rate,
@@ -501,11 +598,49 @@ def _summarize_lcwra_audit_records(records):
         "avg_deadline_slack_min": float(np.mean(deadline_slacks)) if deadline_slacks else np.nan,
         "sla_safe_selection_rate": float(np.mean(sla_safe_flags)) if sla_safe_flags else np.nan,
         "avg_sla_risk_score": float(np.mean(sla_risk_scores)) if sla_risk_scores else np.nan,
-        "rejected_by_sla_guard_rate": float(np.mean(rejected_by_guard_flags)) if rejected_by_guard_flags else np.nan,
+        "selected_plan_rejected_by_sla_guard_rate": (
+            float(np.mean(selected_plan_rejected_flags)) if selected_plan_rejected_flags else np.nan
+        ),
+        "any_candidate_rejected_by_sla_guard_rate": any_candidate_rejected_rate,
+        "candidate_rejected_by_sla_guard_rate": (
+            rejected_candidate_count / candidate_count if candidate_count else np.nan
+        ),
+        # Backward-compatible alias. Prefer any_candidate_rejected_by_sla_guard_rate
+        # for new analysis because this is not a candidate-level rejection ratio.
+        "rejected_by_sla_guard_rate": any_candidate_rejected_rate,
+        "lcwra_unfinished_count": unfinished_count,
+        "lcwra_unfinished_rate": unfinished_count / selected_count if selected_count else np.nan,
+        "lcwra_deadline_expired_unfinished_count": expired_unfinished_count,
+        "lcwra_deadline_expired_unfinished_rate": (
+            expired_unfinished_count / unfinished_count if unfinished_count else np.nan
+        ),
+        "completed_only_low_carbon_miss_rate": completed_only_miss_rate,
+        "all_selected_low_carbon_miss_or_unfinished_rate": all_selected_miss_or_unfinished_rate,
         "lcwra_selected_count": selected_count,
         "lcwra_completed_count": completed_count,
         "lcwra_completion_coverage": completion_coverage,
     }
+
+
+def _format_metric_value(value, metric_name):
+    try:
+        if pd.isna(value):
+            return "nan"
+    except TypeError:
+        pass
+
+    lower_name = metric_name.lower()
+    if "(%)" in metric_name:
+        return f"{float(value):.2f}"
+    if any(token in lower_name for token in ["rate", "ratio", "coverage", "selection_rate", "miss_rate", "safe_selection_rate"]):
+        return f"{float(value):.4f}"
+    if "count" in lower_name or lower_name.startswith("total tasks") or lower_name.startswith("total sla violations"):
+        return f"{float(value):.1f}"
+    return f"{float(value):.2f}"
+
+
+def _format_metric_series(series, metric_name):
+    return series.map(lambda value: _format_metric_value(value, metric_name))
 
 
 # --- Main: load configs once, then parallelize seeds per controller ---
@@ -605,7 +740,16 @@ if __name__ == "__main__":
             "avg_deadline_slack_min": ['mean', 'std'],
             "sla_safe_selection_rate": ['mean', 'std'],
             "avg_sla_risk_score": ['mean', 'std'],
+            "selected_plan_rejected_by_sla_guard_rate": ['mean', 'std'],
+            "any_candidate_rejected_by_sla_guard_rate": ['mean', 'std'],
+            "candidate_rejected_by_sla_guard_rate": ['mean', 'std'],
             "rejected_by_sla_guard_rate": ['mean', 'std'],
+            "lcwra_unfinished_count": ['mean', 'std'],
+            "lcwra_unfinished_rate": ['mean', 'std'],
+            "lcwra_deadline_expired_unfinished_count": ['mean', 'std'],
+            "lcwra_deadline_expired_unfinished_rate": ['mean', 'std'],
+            "completed_only_low_carbon_miss_rate": ['mean', 'std'],
+            "all_selected_low_carbon_miss_or_unfinished_rate": ['mean', 'std'],
             "lcwra_selected_count": ['mean', 'std'],
             "lcwra_completed_count": ['mean', 'std'],
             "lcwra_completion_coverage": ['mean', 'std'],
@@ -631,8 +775,8 @@ if __name__ == "__main__":
             # Check if the corresponding std column exists
             if std_col in summary_df.columns:
                 # Format mean ± (std)
-                mean_series = summary_df[col].map('{:.2f}'.format)
-                std_series = summary_df[std_col].map('{:.2f}'.format)
+                mean_series = _format_metric_series(summary_df[col], metric_base_name)
+                std_series = _format_metric_series(summary_df[std_col], metric_base_name)
                 formatted_summary_df[metric_base_name] = mean_series + ' ± (' + std_series + ')'
 
                 # Mark original mean and std columns for removal
@@ -640,7 +784,7 @@ if __name__ == "__main__":
                 cols_to_drop.append(std_col)
             else:
                 # Only mean exists, just format it and potentially rename
-                formatted_summary_df[metric_base_name] = summary_df[col].map('{:.2f}'.format)
+                formatted_summary_df[metric_base_name] = _format_metric_series(summary_df[col], metric_base_name)
                 if metric_base_name != col: # If renaming occurred
                      cols_to_drop.append(col)
 

@@ -269,6 +269,8 @@ class DatacenterClusterManager:
                                 actual_start_time=None,
                                 actual_finish_time=None,
                                 audit_stage="selected",
+                                dest_dc=task.dest_dc,
+                                config=getattr(task, "lcwra_config", None),
                             )
                         )
 
@@ -298,6 +300,8 @@ class DatacenterClusterManager:
                             selected_plan,
                             getattr(finished_task, "lcwra_candidate_plans", []),
                             audit_stage="completed",
+                            dest_dc=dc,
+                            config=getattr(finished_task, "lcwra_config", None),
                         )
                     )
 

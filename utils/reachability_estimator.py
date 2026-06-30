@@ -33,6 +33,7 @@ def estimate_candidate_plan(task, dest_dc, dest_dc_name, current_time, cluster_m
     decision_time = pd.Timestamp(current_time)
     origin_dc_id = getattr(task, "origin_dc_id", None)
     dest_dc_id = getattr(dest_dc, "dc_id", None)
+    decision_time_step = getattr(getattr(dest_dc, "ci_manager", None), "time_step", None)
 
     transmission_delay_min = _estimate_transmission_delay_min(task, dest_dc, cluster_manager)
     arrival_time = decision_time + pd.Timedelta(minutes=transmission_delay_min)
@@ -144,6 +145,7 @@ def estimate_candidate_plan(task, dest_dc, dest_dc_name, current_time, cluster_m
         predicted_system_carbon_kg=predicted_marginal_system_carbon_kg,
         reason=reason,
         ci_source_mode=cfg.get("ci_source_mode"),
+        decision_time_step=decision_time_step,
     )
 
 

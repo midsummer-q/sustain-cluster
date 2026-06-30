@@ -319,6 +319,7 @@ class DistributeReachableLowCarbon(BaseRBCStrategy):
         task.selected_plan_reason = selected_plan.reason
         task.lcwra_selected_plan = selected_plan
         task.lcwra_candidate_plans = candidate_plans
+        task.lcwra_config = dict(self.config)
 
 
 class DistributeOracleSLAGuardedLCWRA(DistributeReachableLowCarbon):
@@ -368,7 +369,7 @@ class DistributeOracleSLAGuardedLCWRA(DistributeReachableLowCarbon):
                 logger.warning(f"OracleSLAGuardedLCWRA found no candidates for task {task.job_name}; using origin DC.")
             return getattr(task, "origin_dc_id", None)
 
-        selected_plan = self._select_plan(candidate_plans)
+        selected_plan = self._select_plan(candidate_plans, logger=logger)
         self.last_selected_plan = selected_plan
         self._attach_plan_to_task(task, selected_plan, candidate_plans)
 
@@ -396,12 +397,16 @@ class DistributeOracleSLAGuardedLCWRA(DistributeReachableLowCarbon):
 
         min_slack = float(self.config.get("min_deadline_slack_min", 15))
         estimated_wait = float(getattr(plan, "estimated_queue_wait_min", float("inf")))
-        max_wait = self.config.get("max_estimated_queue_wait_min")
-        if max_wait == "None":
-            max_wait = None
+        max_wait = self._max_estimated_queue_wait_min()
+        plan.max_estimated_queue_wait_min = max_wait
 
         finite_wait = math.isfinite(estimated_wait)
-        under_max_wait = True if max_wait is None else estimated_wait <= float(max_wait)
+        under_max_wait = self._within_queue_wait_guard(plan)
+        plan.queue_wait_over_guard_min = (
+            None
+            if max_wait is None or not finite_wait
+            else max(0.0, estimated_wait - float(max_wait))
+        )
         guard_enabled = bool(self.config.get("sla_guard_enabled", True))
         plan.sla_safe = (
             bool(getattr(plan, "resource_feasible", False))
@@ -424,6 +429,12 @@ class DistributeOracleSLAGuardedLCWRA(DistributeReachableLowCarbon):
         plan.selected_guard_stage = None
         return plan
 
+    def _max_estimated_queue_wait_min(self):
+        max_wait = self.config.get("max_estimated_queue_wait_min")
+        if max_wait in (None, "None"):
+            return None
+        return float(max_wait)
+
     def _deadline_slack_min(self, task, plan):
         sla_deadline = getattr(task, "sla_deadline", None)
         planned_finish = getattr(plan, "planned_finish_time", None)
@@ -438,47 +449,86 @@ class DistributeOracleSLAGuardedLCWRA(DistributeReachableLowCarbon):
         except Exception:
             return float("-inf")
 
-    def _select_plan(self, candidate_plans):
-        safe_reachable = [
-            plan for plan in candidate_plans
-            if getattr(plan, "reachable_lcw", False) and getattr(plan, "sla_safe", False)
-        ]
-        if safe_reachable:
-            selected = min(safe_reachable, key=lambda plan: plan.predicted_marginal_system_carbon_kg)
+    def _select_plan(self, candidate_plans, logger=None):
+        for stage in self.config.get("fallback_order", []):
+            selected = self._select_plan_for_stage(stage, candidate_plans, logger=logger)
+            if selected is not None:
+                return selected
+
+        selected = min(candidate_plans, key=lambda plan: _finite_or_inf(plan.estimated_queue_wait_min))
+        selected.reason = "fallback_lowest_estimated_queue_wait_after_empty_configured_stages"
+        selected.selected_guard_stage = "lowest_estimated_queue_wait"
+        return selected
+
+    def _select_plan_for_stage(self, stage, candidate_plans, logger=None):
+        if stage == "reachable_lcw_and_sla_safe":
+            candidates = [
+                plan for plan in candidate_plans
+                if getattr(plan, "reachable_lcw", False) and getattr(plan, "sla_safe", False)
+            ]
+            if not candidates:
+                return None
+            selected = min(candidates, key=lambda plan: _finite_or_inf(plan.predicted_marginal_system_carbon_kg))
             selected.reason = "selected_oracle_sla_guarded_reachable_low_carbon"
-            selected.selected_guard_stage = "reachable_lcw_and_sla_safe"
+            selected.selected_guard_stage = stage
             return selected
 
-        deadline_feasible = [
-            plan for plan in candidate_plans
-            if getattr(plan, "deadline_feasible", False)
-        ]
-        if deadline_feasible:
+        if stage == "deadline_feasible_lowest_sla_risk":
+            candidates = [
+                plan for plan in candidate_plans
+                if getattr(plan, "resource_feasible", False)
+                and getattr(plan, "deadline_feasible", False)
+                and self._within_queue_wait_guard(plan)
+            ]
+            if not candidates:
+                return None
             selected = min(
-                deadline_feasible,
+                candidates,
                 key=lambda plan: (
                     _finite_or_inf(getattr(plan, "sla_risk_score", float("inf"))),
                     _finite_or_inf(getattr(plan, "predicted_marginal_system_carbon_kg", float("inf"))),
                 ),
             )
             selected.reason = "fallback_deadline_feasible_lowest_sla_risk"
-            selected.selected_guard_stage = "deadline_feasible_lowest_sla_risk"
+            selected.selected_guard_stage = stage
             return selected
 
-        resource_feasible = [
-            plan for plan in candidate_plans
-            if getattr(plan, "resource_feasible", False)
-        ]
-        if resource_feasible:
-            selected = min(resource_feasible, key=lambda plan: _finite_or_inf(plan.estimated_queue_wait_min))
-            selected.reason = "fallback_resource_feasible_lowest_estimated_queue_wait"
-            selected.selected_guard_stage = "lowest_estimated_queue_wait"
+        if stage == "lowest_predicted_marginal_system_carbon_feasible":
+            resource_feasible = [
+                plan for plan in candidate_plans
+                if getattr(plan, "resource_feasible", False)
+            ]
+            deadline_feasible = [
+                plan for plan in resource_feasible
+                if getattr(plan, "deadline_feasible", False)
+            ]
+            candidates = deadline_feasible or resource_feasible
+            if not candidates:
+                return None
+            selected = min(candidates, key=lambda plan: _finite_or_inf(plan.predicted_marginal_system_carbon_kg))
+            selected.reason = "fallback_lowest_predicted_marginal_system_carbon_feasible"
+            selected.selected_guard_stage = stage
             return selected
 
-        selected = min(candidate_plans, key=lambda plan: _finite_or_inf(plan.estimated_queue_wait_min))
-        selected.reason = "fallback_lowest_estimated_queue_wait"
-        selected.selected_guard_stage = "lowest_estimated_queue_wait"
-        return selected
+        if stage == "lowest_estimated_queue_wait":
+            if not candidate_plans:
+                return None
+            selected = min(candidate_plans, key=lambda plan: _finite_or_inf(plan.estimated_queue_wait_min))
+            selected.reason = "fallback_lowest_estimated_queue_wait"
+            selected.selected_guard_stage = stage
+            return selected
+
+        message = f"OracleSLAGuardedLCWRA skipping unknown fallback_order stage: {stage}"
+        if logger:
+            logger.warning(message)
+        else:
+            logging.getLogger(__name__).warning(message)
+        return None
+
+    def _within_queue_wait_guard(self, plan):
+        max_wait = self._max_estimated_queue_wait_min()
+        estimated_wait = _finite_or_inf(getattr(plan, "estimated_queue_wait_min", float("inf")))
+        return math.isfinite(estimated_wait) and (max_wait is None or estimated_wait <= float(max_wait))
 
 
 def _finite_or_inf(value):

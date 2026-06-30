@@ -7,6 +7,9 @@ oracle_sla_guarded_lcwra:
   sla_guard_enabled: true
   min_deadline_slack_min: 15
   queue_wait_safety_factor: 1.2
+  # Hard guard only for reachable_lcw_and_sla_safe and
+  # deadline_feasible_lowest_sla_risk. Later fallback stages may still select
+  # longer waits, but the overflow is recorded in audit fields.
   max_estimated_queue_wait_min: null
   objective: "sla_guarded_marginal_system_carbon"
   ci_source_mode: "oracle"

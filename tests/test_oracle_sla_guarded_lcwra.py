@@ -1,5 +1,11 @@
+from types import SimpleNamespace
+
 import pandas as pd
 
+from scripts.generate_table1_metrics_parallel import (
+    _summarize_lcwra_audit_records,
+    collect_unfinished_lcwra_audit_records,
+)
 from utils.lcwra_types import CandidatePlan
 from utils.task_assignment_strategies import DistributeOracleSLAGuardedLCWRA
 
@@ -85,3 +91,127 @@ def test_falls_back_to_lowest_queue_wait_when_no_deadline_feasible_candidate():
 
     assert selected.dest_dc_id == 2
     assert selected.selected_guard_stage == "lowest_estimated_queue_wait"
+
+
+def test_apply_sla_guard_computes_slack_safe_and_risk():
+    strategy = DistributeOracleSLAGuardedLCWRA(
+        config={
+            "min_deadline_slack_min": 15,
+            "queue_wait_safety_factor": 1.2,
+            "max_estimated_queue_wait_min": 30,
+        }
+    )
+    plan = _plan(
+        1,
+        reachable_lcw=True,
+        estimated_queue_wait_min=10.0,
+        predicted_marginal_system_carbon_kg=1.0,
+    )
+    task = SimpleNamespace(sla_deadline=plan.planned_finish_time + pd.Timedelta(minutes=20))
+
+    strategy._apply_sla_guard(plan, task)
+
+    assert plan.deadline_slack_min == 20.0
+    assert plan.sla_safe is True
+    assert abs(plan.sla_risk_score - 2.0) < 1e-9
+    assert plan.rejected_by_sla_guard is False
+    assert plan.queue_wait_over_guard_min == 0.0
+
+
+def test_select_plan_respects_configured_fallback_order():
+    strategy = DistributeOracleSLAGuardedLCWRA(
+        config={
+            "fallback_order": [
+                "lowest_estimated_queue_wait",
+                "reachable_lcw_and_sla_safe",
+            ]
+        }
+    )
+    safe_reachable_slow = _plan(
+        1,
+        reachable_lcw=True,
+        deadline_slack_min=30.0,
+        estimated_queue_wait_min=30.0,
+        predicted_marginal_system_carbon_kg=0.1,
+    )
+    fast_non_lcw = _plan(
+        2,
+        reachable_lcw=False,
+        deadline_slack_min=30.0,
+        estimated_queue_wait_min=2.0,
+        predicted_marginal_system_carbon_kg=10.0,
+    )
+
+    selected = strategy._select_plan([safe_reachable_slow, fast_non_lcw])
+
+    assert selected.dest_dc_id == 2
+    assert selected.selected_guard_stage == "lowest_estimated_queue_wait"
+
+
+def test_candidate_rejected_rate_summary():
+    records = [
+        {
+            "audit_stage": "selected",
+            "rejected_by_sla_guard": False,
+            "any_candidate_rejected_by_sla_guard": True,
+            "rejected_by_sla_guard_candidate_count": 2,
+            "candidate_count": 5,
+        },
+        {
+            "audit_stage": "selected",
+            "rejected_by_sla_guard": False,
+            "any_candidate_rejected_by_sla_guard": False,
+            "rejected_by_sla_guard_candidate_count": 0,
+            "candidate_count": 3,
+        },
+        {
+            "audit_stage": "selected",
+            "rejected_by_sla_guard": True,
+            "any_candidate_rejected_by_sla_guard": True,
+            "rejected_by_sla_guard_candidate_count": 1,
+            "candidate_count": 2,
+        },
+    ]
+
+    summary = _summarize_lcwra_audit_records(records)
+
+    assert summary["selected_plan_rejected_by_sla_guard_rate"] == 1 / 3
+    assert summary["any_candidate_rejected_by_sla_guard_rate"] == 2 / 3
+    assert summary["candidate_rejected_by_sla_guard_rate"] == 3 / 10
+    assert summary["rejected_by_sla_guard_rate"] == summary["any_candidate_rejected_by_sla_guard_rate"]
+
+
+def test_unfinished_lcwra_records_are_collected():
+    plan = _plan(1, reachable_lcw=True, deadline_slack_min=20.0)
+    task = SimpleNamespace(
+        job_name="unfinished-task",
+        origin_dc_id=1,
+        dest_dc_id=1,
+        sla_deadline=pd.Timestamp("2026-01-01T00:20:00Z"),
+        start_time=None,
+        finish_time=None,
+        lcwra_selected_plan=plan,
+        lcwra_candidate_plans=[plan],
+        lcwra_config={"horizon_steps": 32, "timestep_minutes": 15, "low_carbon_quantile": 0.25},
+    )
+    dc = SimpleNamespace(pending_tasks=[task], running_tasks=[], ci_manager=None)
+    cluster_manager = SimpleNamespace(datacenters={"DC1": dc}, in_transit_tasks=[])
+    env = SimpleNamespace(
+        cluster_manager=cluster_manager,
+        in_transit_tasks=[],
+        deferred_tasks=[],
+    )
+
+    records = collect_unfinished_lcwra_audit_records(
+        env,
+        controller_name="RBC (Oracle SLA-Guarded LCWRA)",
+        seed=0,
+        end_time=pd.Timestamp("2026-01-01T01:00:00Z"),
+    )
+
+    assert len(records) == 1
+    assert records[0]["audit_stage"] == "unfinished"
+    assert records[0]["unfinished_location"] == "pending"
+    assert records[0]["sla_deadline_expired_at_episode_end"] is True
+    assert records[0]["candidate_count"] == 1
+    assert records[0]["rejected_by_sla_guard_candidate_count"] == 0

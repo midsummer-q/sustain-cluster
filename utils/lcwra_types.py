@@ -37,5 +37,8 @@ class CandidatePlan:
     sla_safe: bool = False
     sla_risk_score: Optional[float] = None
     queue_wait_safety_factor: Optional[float] = None
+    max_estimated_queue_wait_min: Optional[float] = None
+    queue_wait_over_guard_min: Optional[float] = None
     selected_guard_stage: Optional[str] = None
     rejected_by_sla_guard: bool = False
+    decision_time_step: Optional[int] = None
